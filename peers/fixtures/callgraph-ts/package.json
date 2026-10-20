@@ -1,0 +1,8 @@
+{
+  "name": "callgraph-fixture",
+  "private": true,
+  "type": "module",
+  "devDependencies": {
+    "typescript": "^7.0.2"
+  }
+}

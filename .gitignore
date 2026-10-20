@@ -93,3 +93,9 @@ soak-results-query-leak/
 # Nix build symlinks (nix build → ./result, ./result-1, …)
 /result
 /result-*
+
+# SCIP→cbm probe fixtures / demo artifacts
+peers/out/
+peers/fixtures/**/.ast-cache/
+peers/fixtures/**/.codebase-memory/
+peers/fixtures/**/*.scip
