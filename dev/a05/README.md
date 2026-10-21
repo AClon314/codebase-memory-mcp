@@ -16,8 +16,9 @@ useOverload -> pick                get -> load
 load -> make                       go -> get, helper
 ```
 
-The module-level constructor `Comp.svelte -> UserRepo` is scored separately:
-its source is the Svelte module, not a callable.
+Module-level calls are scored separately because their source is the Svelte
+module, not a callable: `Comp.svelte -> UserRepo` (constructor) and
+`Comp.svelte -> go` (top-level reactive statement).
 
 ## Reproduce
 
@@ -50,7 +51,9 @@ scores separately. It does not hide false positives.
 | Tool | Function TP | FP | FN | Precision | Recall | F1 |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
 | cbm-native | 8 | 0 | 3 | 100.0% | 72.7% | 84.2% |
-| SCIP writer | 11 | 1 | 0 | 91.7% | 100.0% | 95.7% |
+| SCIP writer | 11 | 0 | 0 | 100.0% | 100.0% | 100.0% |
+
+Module-level edges: cbm `TP=1 FP=1`; SCIP writer `TP=2 FP=0` after A0.6.
 
 cbm misses exactly the cases the gate cares about:
 
@@ -60,9 +63,9 @@ cbm misses exactly the cases the gate cares about:
   `cbm_run_ts_lsp` does not run on the embedded block, so the receiver type is
   unavailable.
 
-SCIP covers all 11 function calls. Its one function-level FP is `go -> go`:
-the top-level reactive statement `$: name = go()` is attributed to `go`
-instead of the module. It also emits five module-level CALLS from
+SCIP covers all 11 function calls. The former `go -> go` FP is fixed: the
+top-level reactive statement `$: name = go()` now stays on the module. The
+writer also stopped emitting the five module-level CALLS from
 import/export/extends occurrences:
 
 ```text
@@ -77,6 +80,16 @@ UserRepo -> BaseRepo           extends
 Those are writer hygiene issues, not semantic misses: SCIP has the right
 symbols, but the writer must not turn every reference into `CALLS`.
 
+## A0.6 result
+
+The writer now:
+
+1. Emits `CALLS` only for `SyntaxKind.IdentifierFunction` occurrences; import,
+   export and extends references carry no call syntax kind.
+2. Uses the definition's `enclosing_range` to bound the fallback caller search;
+   a top-level statement no longer inherits the previous function.
+3. Re-scores as **function 11/11, 0 FP; module 2/2, 0 FP**.
+
 ## Decision
 
 **Use SCIP for TS/JS/Svelte; keep cbm for the other ~160 languages.**
@@ -90,11 +103,6 @@ symbols, but the writer must not turn every reference into `CALLS`.
 - Keep the writer external for now (D4). Do not deep-fork `src/scip/` until
   incremental indexing or a single-binary product actually requires it.
 
-Before a global call graph consumes SCIP output, fix the writer:
-
-1. Emit `CALLS` only for actual call expressions; skip import/export/extends
-   occurrences (the five module FPs above).
-2. Attribute top-level calls to the Module node (or a synthetic module
-   function), not to the last enclosing named function (`go -> go`).
-3. Keep the existing `enclosing_range` fix; it is why `useHof -> helper` is
-   now correct (the older report's 11/12 no longer applies).
+The writer hygiene work is done (A0.6). A global call graph can now consume
+SCIP output without the import/export/extends false positives or the
+`go -> go` attribution error.

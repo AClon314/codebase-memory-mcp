@@ -35,7 +35,7 @@ FUNCTION_GT = {
 
 # `new UserRepo()` at Svelte module top level. Kept out of FUNCTION_GT because
 # the source is not a callable.
-MODULE_GT = {("Comp.svelte", "UserRepo")}
+MODULE_GT = {("Comp.svelte", "UserRepo"), ("Comp.svelte", "go")}
 
 QUERY = """
 SELECT a.label AS source_label,
