@@ -95,7 +95,7 @@ soak-results-query-leak/
 /result-*
 
 # SCIP→cbm probe fixtures / demo artifacts
-peers/out/
-peers/fixtures/**/.ast-cache/
-peers/fixtures/**/.codebase-memory/
-peers/fixtures/**/*.scip
+dev/out/
+dev/fixtures/**/.ast-cache/
+dev/fixtures/**/.codebase-memory/
+dev/fixtures/**/*.scip

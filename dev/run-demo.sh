@@ -2,10 +2,10 @@
 # A0 + B0 integration demo: .scip -> cbm DB -> cbm HTTP -> Svelte UI.
 set -euo pipefail
 
-PEERS="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-CBM_REPO="$(cd "$PEERS/.." && pwd)"
+DEV="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CBM_REPO="$(cd "$DEV/.." && pwd)"
 RULES="$(cd "$CBM_REPO/.." && pwd)"
-FIX="$PEERS/fixtures/callgraph-ts-hard"
+FIX="$DEV/fixtures/callgraph-ts-hard"
 OUT="${DEMO_OUT:-/tmp/code-graph-demo}"
 CACHE="${CBM_CACHE_DIR:-$OUT/cache}"
 PROJECT="${DEMO_PROJECT:-fixture-hard-scip}"
@@ -31,7 +31,7 @@ trap cleanup EXIT INT TERM
 
 need() { command -v "$1" >/dev/null 2>&1 || { echo "missing: $1" >&2; exit 1; }; }
 [ -x "$BUN" ] || { echo "missing bun: $BUN" >&2; exit 1; }
-[ -x "$CBM" ] || { echo "missing cbm: $CBM (run peers/install.sh)" >&2; exit 1; }
+[ -x "$CBM" ] || { echo "missing cbm: $CBM (run dev/install.sh)" >&2; exit 1; }
 
 # 1. SCIP index (only if absent).
 if [ ! -f "$SCIP" ]; then
@@ -67,7 +67,7 @@ fi
 if ! curl -sf --max-time 1 "http://127.0.0.1:$REACT_PORT/" >/dev/null; then
   echo "== React proxy :$REACT_PORT -> 127.0.0.1:$CBM_PORT"
   setsid env PROXY_HOST=0.0.0.0 PROXY_PORT="$REACT_PORT" CBM_UPSTREAM_HOST=127.0.0.1 CBM_UPSTREAM_PORT="$CBM_PORT" \
-    "$BUN" "$PEERS/react-ui-proxy.ts" > "$OUT/react-proxy.log" 2>&1 &
+    "$BUN" "$DEV/react-ui-proxy.ts" > "$OUT/react-proxy.log" 2>&1 &
   PROXY_PID=$!
   for _ in $(seq 1 30); do
     curl -sf --max-time 1 "http://127.0.0.1:$REACT_PORT/" >/dev/null && break
