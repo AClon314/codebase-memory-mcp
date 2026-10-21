@@ -2,11 +2,11 @@
 # 最小复现：cbm 索引硬 fixture；SCIP 索引 + 探针写 cbm 兼容 DB。
 set -euo pipefail
 
-PEERS="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-CBM_REPO="$(cd "$PEERS/.." && pwd)"
+DEV="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CBM_REPO="$(cd "$DEV/.." && pwd)"
 RULES="$(cd "$CBM_REPO/.." && pwd)"
-FIX="$PEERS/fixtures/callgraph-ts-hard"
-OUT="$PEERS/out"
+FIX="$DEV/fixtures/callgraph-ts-hard"
+OUT="$DEV/out"
 SCIP_PRINT="${SCIP_PRINT:-$HOME/tools/scip/scip}"
 BUN="${BUN:-$HOME/.bun/bin/bun}"
 CBM="$RULES/cbm-runtime/node_modules/.bin/codebase-memory-mcp"
@@ -35,7 +35,7 @@ run scip-index node "$RULES/scip-typescript/dist/src/main.js" index \
 run scip-print "$SCIP_PRINT" print --json "$OUT/scip-hard/hard.scip" \
   > "$OUT/scip-hard/hard.json"
 
-run scip-probe python3 "$PEERS/scip-cbm-probe.py" \
+run scip-probe python3 "$DEV/scip-cbm-probe.py" \
   "$OUT/scip-hard/hard.json" scip-probe-hard "$FIX"
 
 run scip-trace "$CBM" cli --json trace_path --function-name useAlias \

@@ -1,4 +1,4 @@
-# cbm/peers
+# cbm/dev
 
 只保留 **SCIP→cbm 探针** + 两个 fixture；cbm 运行时已移到
 [`../../cbm-runtime/`](../../cbm-runtime/)（codebase-memory-mcp 0.12.1）。
