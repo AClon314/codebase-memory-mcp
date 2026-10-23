@@ -343,7 +343,7 @@ bun run build     # success（bundle ~1.57 MB，chunk warning 未处理）
 
 4. **字符画没有 ANSI 颜色**
    - 当前 web 用 `renderTerminalCanvas({ color: false })`
-   - 状态 marker（`○/●/✓/✕`）保留；TUI 的黄色/绿色状态色未在 web 还原
+   - 状态 marker（`○/⠋/✓/✕`）保留；TUI 的黄色/绿色状态色未在 web 还原
    - 如果需要，可加 ANSI → `<span>` 渲染；Copy 仍复制纯文本
 
 5. **Copy 依赖浏览器权限**
