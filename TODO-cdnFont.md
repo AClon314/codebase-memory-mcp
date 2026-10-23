@@ -21,7 +21,8 @@
 >   块由标签按需拉取）；伪造本机已装字体后 `zeosevenRequests: []`、
 >   `document.fonts.size === 0`。
 > - `◐`（U+25D0）不在 CDN 字体覆盖范围内，浏览器会回落到比例字体，宽度不是 1 个
->   字符格；GUI 静态视图改为 `●`（Maple 有、宽度恰好 1 格）。
+>   字符格；running marker 改用盲文 spinner（`⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏`），Maple 覆盖且宽度
+>   恰好 1 格。`●` 会和完成态 `✓` 混淆，不再使用。
 
 目标仓库：`gpen-js/rules/cbm`（codebase-memory-mcp 子模块）
 影响面（React 版）：`graph-ui`（含被 `scripts/embed-frontend.sh` 塞进二进制的产物）+ `src/ui/http_server.h` 的 CSP + 一个 C 测试
