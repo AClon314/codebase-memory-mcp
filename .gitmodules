@@ -1,0 +1,6 @@
+[submodule "graph-ui-svelte"]
+	path = graph-ui-svelte
+	url = https://github.com/AClon314/code-graph
+[submodule "tools/scip-cbm-writer"]
+	path = tools/scip-cbm-writer
+	url = https://github.com/AClon314/scip-cbm-writer
