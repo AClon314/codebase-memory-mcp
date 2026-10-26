@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# A0 + B0 integration demo: .scip -> cbm DB -> cbm HTTP -> Svelte UI.
+# Historical A0 + B0 integration demo: .scip -> cbm DB -> cbm HTTP -> Svelte UI.
+# The current loop is run.sh; this script keeps the embedded React UI path.
 set -euo pipefail
 
 DEV="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -63,11 +64,11 @@ if ! curl -sf --max-time 1 "http://127.0.0.1:$CBM_PORT/api/tree?project=$PROJECT
   done
 fi
 
-# 4. React graph-ui on 0.0.0.0 (cbm itself only binds loopback).
+# 4. cbm's embedded React UI on 0.0.0.0 (cbm itself only binds loopback).
 if ! curl -sf --max-time 1 "http://127.0.0.1:$REACT_PORT/" >/dev/null; then
-  echo "== React proxy :$REACT_PORT -> 127.0.0.1:$CBM_PORT"
+  echo "== cbm HTTP proxy :$REACT_PORT -> 127.0.0.1:$CBM_PORT"
   setsid env PROXY_HOST=0.0.0.0 PROXY_PORT="$REACT_PORT" CBM_UPSTREAM_HOST=127.0.0.1 CBM_UPSTREAM_PORT="$CBM_PORT" \
-    "$BUN" "$DEV/react-ui-proxy.ts" > "$OUT/react-proxy.log" 2>&1 &
+    "$BUN" "$DEV/cbm-http-proxy.ts" > "$OUT/react-proxy.log" 2>&1 &
   PROXY_PID=$!
   for _ in $(seq 1 30); do
     curl -sf --max-time 1 "http://127.0.0.1:$REACT_PORT/" >/dev/null && break

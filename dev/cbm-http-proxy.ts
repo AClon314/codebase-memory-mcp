@@ -1,15 +1,18 @@
 #!/usr/bin/env bun
 /**
- * Expose cbm's loopback-only React UI on 0.0.0.0.
+ * Expose cbm's loopback-only HTTP API/UI on another address.
  *
  * cbm deliberately binds 127.0.0.1 and rejects foreign Host/Origin headers.
- * This proxy keeps that invariant on the wire to cbm, but lets a browser on
- * the LAN/Tailscale load the stable React UI:
+ * This proxy keeps that invariant on the wire to cbm, but lets a browser or
+ * another local process reach it:
  *
- *   browser -> 0.0.0.0:9749 -> 127.0.0.1:9751
+ *   client -> 0.0.0.0:9749 -> 127.0.0.1:9751
  *
  * It rewrites Host to cbm's own authority and drops Origin, so cbm's
  * same-server checks still pass. No authentication is added.
+ *
+ * This is a generic cbm HTTP/WebSocket proxy, not specific to cbm's embedded
+ * React UI.
  */
 import http from "node:http";
 import net from "node:net";
@@ -67,5 +70,5 @@ server.on("upgrade", (req, socket, head) => {
 });
 
 server.listen(LISTEN_PORT, LISTEN_HOST, () => {
-  console.log(`React graph-ui: http://${LISTEN_HOST}:${LISTEN_PORT}/ -> ${UPSTREAM_AUTHORITY}`);
+  console.log(`cbm HTTP proxy: http://${LISTEN_HOST}:${LISTEN_PORT}/ -> ${UPSTREAM_AUTHORITY}`);
 });
