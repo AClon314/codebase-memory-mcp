@@ -22,4 +22,4 @@ builtin cd "$RULES/cbm-runtime"
 "$BUN" pm untrusted || true
 builtin cd "$DEV"
 
-echo "done. SCIP indexer 在 ../../scip-typescript；探针见 run-fixture.sh"
+echo "done. SCIP indexer 在 ../../scip-typescript；当前闭环见 run.sh（--setup 也会装 writer 依赖）"
