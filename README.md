@@ -145,6 +145,8 @@ Installation also equips supported coding agents to use the graph in daily work.
 
 Hook augmentation is context-only and fail-open: it does not replace or block the requested tool call. Features vary by client and platform; some clients use durable instructions or a parent-agent handoff instead of hooks or direct subagent MCP access. Codex users review and trust installed hooks through `/hooks`. See [Multi-Agent Support](#multi-agent-support) and [Sessions, compaction, and subagents](#sessions-compaction-and-subagents) for exact support and activation requirements.
 
+Hooks are enabled by default. Run `codebase-memory-mcp install --no-hooks` to remove CBM-managed hooks while keeping MCP registration and other integration files; the choice persists for later installs and updates. Run `codebase-memory-mcp install --hooks` to re-enable them, or inspect the current preference with `codebase-memory-mcp config get install_hooks`.
+
 ### Session Coordination Daemon
 
 CBM automatically shares one per-account coordination daemon across Claude Code, Codex, OpenCode, and every other configured client. There is no opt-in setting for MCP servers or hook clients: the first daemon-backed CBM session starts it, each session registers its own work, and a session-managed daemon stops after the final session. A daemon started with `daemon start` remains running until stopped. The daemon owns long-lived background services such as watchers, shared indexing jobs, and the optional UI. Closing one session cancels work owned only by that session, while work still needed by another session continues.
@@ -262,6 +264,8 @@ Watcher registration is controlled globally by `auto_watch` (default `true`). On
 To turn the watcher off entirely, set `config set watcher_enabled false` (default `true`): the background poll thread never starts and no project is registered, while `auto_index` and manual `index_repository` keep working. Unlike `auto_watch`, which takes effect on the next refresh or registration request, `watcher_enabled` is read once when the background daemon starts, so run `codebase-memory-mcp daemon stop` after changing it; reconnecting your MCP client alone will not restart the daemon. See [docs/CONFIGURATION.md](docs/CONFIGURATION.md#2-cli-managed-runtime-settings).
 
 The watcher follows **git** projects only by default: a project indexed from a directory that is not a git repository is not watched and stays at its last index until you run `index_repository` again. To have such roots polled too, set `config set watch_non_git true` (default `false`, read when the daemon starts): they are then checked on the same cadence with a file-tree scan that uses the indexer's own ignore rules.
+
+Linked git worktrees are indexed as their own projects by default. Set `config set ignore_worktrees true` to skip them on the automatic paths — useful when short-lived `git worktree add` checkouts would otherwise each leave behind a permanent index of the same repository. An explicit `index_repository` call on a worktree is then refused unless you pass `index_worktree=true`. See [docs/CONFIGURATION.md](docs/CONFIGURATION.md#ignore_worktrees).
 
 ### Keeping Up to Date
 
@@ -1016,15 +1020,18 @@ codebase-memory-mcp config list                          # show all settings
 codebase-memory-mcp config set auto_index true           # auto-index on session start
 codebase-memory-mcp config set auto_index_limit 50000    # max files for auto-index
 codebase-memory-mcp config set auto_watch false          # remove/disable all background watches (default: true)
+codebase-memory-mcp config set ignore_worktrees true     # skip linked git worktrees when auto-indexing (default: false)
 codebase-memory-mcp config set doc_candidates false      # skip doc<->code candidate scoring on huge repos (default: auto = on for full, off for moderate/fast)
 codebase-memory-mcp config set watcher_enabled false     # stop the watcher thread entirely (default: true)
 codebase-memory-mcp config set watch_non_git true        # also poll non-git project roots (default: false)
 codebase-memory-mcp config set index_max_files 250000    # optional per-index source-file limit
 codebase-memory-mcp config set index_max_source_mb 16384 # optional per-index source-size limit
+codebase-memory-mcp config set index_max_rss_mb 8192     # optional worker-tree charged-memory limit
+codebase-memory-mcp config set index_max_duration_seconds 3600 # optional per-request duration
 codebase-memory-mcp config reset auto_index              # reset to default
 ```
 
-The two `index_max_*` settings default to `off`. Exceeding one fails the complete
+The four `index_max_*` settings default to `off`. Exceeding one fails the complete
 index attempt rather than publishing a partial graph; an existing serving index
 is preserved. See [Index resource limits](docs/INDEX_RESOURCE_LIMITS.md).
 

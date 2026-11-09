@@ -27,6 +27,7 @@
 #include <foundation/platform.h>
 #include <foundation/private_file_lock.h>
 #include <foundation/sha256.h>
+#include <foundation/str_util.h>
 #include <mcp/mcp.h>
 #include <mcp/index_supervisor.h>
 #include <pipeline/pipeline.h>
@@ -2479,6 +2480,540 @@ TEST(cli_activation_commands_reject_malformed_and_unknown_flags) {
     ASSERT_EQ(update_rc, 1);
     ASSERT_EQ(uninstall_rc, 1);
     ASSERT_EQ(fake.mutation_reserve_count, 0);
+    PASS();
+}
+
+TEST(cli_install_hooks_preference_persists_and_migrates_owned_state) {
+    char tmpdir[512];
+    snprintf(tmpdir, sizeof(tmpdir), "%s/cli-install-hooks-XXXXXX", cbm_tmpdir());
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    const char *const env_names[] = {"HOME", "CBM_CACHE_DIR", "CLAUDE_CONFIG_DIR", "PATH"};
+    char *saved_env[sizeof(env_names) / sizeof(env_names[0])];
+    for (size_t i = 0U; i < sizeof(env_names) / sizeof(env_names[0]); i++) {
+        saved_env[i] = save_test_env(env_names[i]);
+        cbm_unsetenv(env_names[i]);
+    }
+
+    char cache_dir[640];
+    char claude_dir[640];
+    char settings_path[768];
+    char mcp_path[768];
+    char db_path[768];
+    char gate_path[768];
+    char session_path[768];
+    char subagent_path[768];
+    snprintf(cache_dir, sizeof(cache_dir), "%s/cache", tmpdir);
+    snprintf(claude_dir, sizeof(claude_dir), "%s/.claude", tmpdir);
+    snprintf(settings_path, sizeof(settings_path), "%s/settings.json", claude_dir);
+    snprintf(mcp_path, sizeof(mcp_path), "%s/.claude.json", tmpdir);
+    snprintf(db_path, sizeof(db_path), "%s/_config.db", cache_dir);
+#ifdef _WIN32
+    snprintf(gate_path, sizeof(gate_path), "%s/hooks/cbm-code-discovery-gate.cmd", claude_dir);
+    snprintf(session_path, sizeof(session_path), "%s/hooks/cbm-session-reminder.cmd", claude_dir);
+    snprintf(subagent_path, sizeof(subagent_path), "%s/hooks/cbm-subagent-reminder.cmd", claude_dir);
+#else
+    snprintf(gate_path, sizeof(gate_path), "%s/hooks/cbm-code-discovery-gate", claude_dir);
+    snprintf(session_path, sizeof(session_path), "%s/hooks/cbm-session-reminder", claude_dir);
+    snprintf(subagent_path, sizeof(subagent_path), "%s/hooks/cbm-subagent-reminder", claude_dir);
+#endif
+    test_mkdirp(claude_dir);
+    write_test_file(settings_path,
+                    "{\"hooks\":{\"PreToolUse\":[{\"matcher\":\"Bash\",\"hooks\":[{\"type\":"
+                    "\"command\",\"command\":\"/usr/bin/foreign-hook\"}]}]}}\n");
+    cbm_setenv("HOME", tmpdir, 1);
+    cbm_setenv("CBM_CACHE_DIR", cache_dir, 1);
+    cbm_setenv("PATH", tmpdir, 1);
+
+    cli_activation_fake_t fake = {.mutation_reserve_result = 1};
+    cbm_cli_activation_ops_t ops = cli_activation_fake_ops(&fake);
+    cbm_cli_set_activation_ops_for_test(&ops);
+
+    char *conflict_a[] = {"--hooks", "--no-hooks"};
+    char *conflict_b[] = {"--no-hooks", "--hooks"};
+    int conflict_a_rc = cli_test_cmd_install(2, conflict_a);
+    int conflict_b_rc = cli_test_cmd_install(2, conflict_b);
+
+    char *default_args[] = {"--skip-binary", "--clients=claude", "--yes"};
+    int default_rc = cli_test_cmd_install(3, default_args);
+    char *default_state = read_test_file_alloc(settings_path);
+    bool default_hook = default_state && strstr(default_state, "hook-augment") &&
+                        strstr(default_state, "/usr/bin/foreign-hook");
+    bool default_scripts = cbm_file_exists(gate_path) && cbm_file_exists(session_path) &&
+                           cbm_file_exists(subagent_path);
+    free(default_state);
+
+    char *no_hooks_plan_args[] = {"--plan", "--no-hooks"};
+    int no_hooks_plan_rc = cli_test_cmd_install(2, no_hooks_plan_args);
+    char *disabled_plan = cbm_build_install_plan_json(tmpdir, "/opt/codebase-memory-mcp");
+    yyjson_doc *disabled_doc =
+        disabled_plan ? yyjson_read(disabled_plan, strlen(disabled_plan), 0) : NULL;
+    yyjson_val *disabled_root = disabled_doc ? yyjson_doc_get_root(disabled_doc) : NULL;
+    yyjson_val *disabled_hooks =
+        disabled_root ? yyjson_obj_get(disabled_root, "hooks_planned") : NULL;
+    yyjson_val *disabled_configs =
+        disabled_root ? yyjson_obj_get(disabled_root, "config_files_planned") : NULL;
+    bool disabled_plan_ok = disabled_hooks && yyjson_is_arr(disabled_hooks) &&
+                            yyjson_arr_size(disabled_hooks) == 0U && disabled_configs &&
+                            yyjson_is_arr(disabled_configs) &&
+                            yyjson_arr_size(disabled_configs) > 0U;
+    yyjson_doc_free(disabled_doc);
+    free(disabled_plan);
+
+    char *no_hooks_dry_args[] = {"--dry-run", "--no-hooks", "--skip-binary", "--clients=claude",
+                                 "--yes"};
+    int no_hooks_dry_rc = cli_test_cmd_install(5, no_hooks_dry_args);
+    struct stat db_status;
+    bool previews_read_only = stat(db_path, &db_status) != 0;
+
+    char *no_hooks_args[] = {"--no-hooks", "--skip-binary", "--clients=claude", "--yes"};
+    int no_hooks_rc = cli_test_cmd_install(4, no_hooks_args);
+    cbm_config_t *cfg = cbm_config_open(cache_dir);
+    bool stored_false = cfg && !cbm_config_get_bool(cfg, CBM_CONFIG_INSTALL_HOOKS, true);
+    cbm_config_close(cfg);
+    char *disabled_state = read_test_file_alloc(settings_path);
+    char *disabled_mcp = read_test_file_alloc(mcp_path);
+    bool disabled_ok = disabled_state && strstr(disabled_state, "/usr/bin/foreign-hook") &&
+                       !strstr(disabled_state, "hook-augment") && disabled_mcp &&
+                       strstr(disabled_mcp, "codebase-memory-mcp");
+    bool no_hooks_scripts_gone = !cbm_file_exists(gate_path) && !cbm_file_exists(session_path) &&
+                               !cbm_file_exists(subagent_path);
+    free(disabled_state);
+    free(disabled_mcp);
+
+    char *bare_args[] = {"--skip-binary", "--clients=claude", "--yes"};
+    int bare_disabled_rc = cli_test_cmd_install(3, bare_args);
+    disabled_state = read_test_file_alloc(settings_path);
+    bool bare_disabled = disabled_state && strstr(disabled_state, "/usr/bin/foreign-hook") &&
+                         !strstr(disabled_state, "hook-augment");
+    bool bare_scripts_gone =
+        !cbm_file_exists(gate_path) && !cbm_file_exists(session_path) &&
+        !cbm_file_exists(subagent_path);
+    free(disabled_state);
+
+    char *hooks_plan_args[] = {"--plan", "--hooks"};
+    char *hooks_dry_args[] = {"--dry-run", "--hooks", "--skip-binary", "--clients=claude", "--yes"};
+    int hooks_plan_rc = cli_test_cmd_install(2, hooks_plan_args);
+    int hooks_dry_rc = cli_test_cmd_install(5, hooks_dry_args);
+    cfg = cbm_config_open(cache_dir);
+    bool previews_retained_false = cfg && !cbm_config_get_bool(cfg, CBM_CONFIG_INSTALL_HOOKS, true);
+    cbm_config_close(cfg);
+
+    char *hooks_args[] = {"--hooks", "--skip-binary", "--clients=claude", "--yes"};
+    int hooks_rc = cli_test_cmd_install(4, hooks_args);
+    cfg = cbm_config_open(cache_dir);
+    bool stored_true = cfg && cbm_config_get_bool(cfg, CBM_CONFIG_INSTALL_HOOKS, false);
+    cbm_config_close(cfg);
+    char *enabled_state = read_test_file_alloc(settings_path);
+    bool enabled_ok = enabled_state && strstr(enabled_state, "hook-augment") &&
+                      strstr(enabled_state, "/usr/bin/foreign-hook");
+    bool hooks_scripts_back = cbm_file_exists(gate_path) && cbm_file_exists(session_path) &&
+                              cbm_file_exists(subagent_path);
+    free(enabled_state);
+    int bare_enabled_rc = cli_test_cmd_install(3, bare_args);
+    bool bare_scripts_enabled = cbm_file_exists(gate_path) && cbm_file_exists(session_path) &&
+                                cbm_file_exists(subagent_path);
+
+    const char *foreign_session_script =
+#ifdef _WIN32
+        "@echo off\r\nC:\\tmp\\user-owned-session-hook.cmd\r\n";
+#else
+        "#!/bin/sh\n/usr/bin/user-owned-session-hook\n";
+#endif
+    write_test_file(session_path, foreign_session_script);
+    int foreign_no_hooks_rc = cli_test_cmd_install(4, no_hooks_args);
+    char *preserved_session = read_test_file_alloc(session_path);
+    bool foreign_session_preserved =
+        foreign_no_hooks_rc == 0 && preserved_session &&
+        strcmp(preserved_session, foreign_session_script) == 0 && !cbm_file_exists(gate_path) &&
+        !cbm_file_exists(subagent_path);
+    free(preserved_session);
+
+    bool results_ok =
+        conflict_a_rc == 1 && conflict_b_rc == 1 && default_rc == 0 && default_hook &&
+        default_scripts && no_hooks_plan_rc == 0 && disabled_plan_ok && no_hooks_dry_rc == 0 &&
+        previews_read_only && no_hooks_rc == 0 && stored_false && disabled_ok &&
+        no_hooks_scripts_gone && bare_disabled_rc == 0 && bare_disabled && bare_scripts_gone &&
+        hooks_plan_rc == 0 && hooks_dry_rc == 0 && previews_retained_false && hooks_rc == 0 &&
+        stored_true && enabled_ok && hooks_scripts_back && bare_enabled_rc == 0 &&
+        bare_scripts_enabled && foreign_session_preserved && fake.mutation_reserve_count > 0;
+
+    cbm_cli_set_activation_ops_for_test(NULL);
+    cbm_set_auto_answer_for_test(0);
+    for (size_t i = 0U; i < sizeof(env_names) / sizeof(env_names[0]); i++) {
+        restore_test_env(env_names[i], saved_env[i]);
+    }
+    test_rmdir_r(tmpdir);
+
+    ASSERT_TRUE(results_ok);
+    PASS();
+}
+
+TEST(cli_no_hooks_plan_covers_every_hook_installer_family) {
+    char tmpdir[512];
+    snprintf(tmpdir, sizeof(tmpdir), "%s/cli-hook-families-XXXXXX", cbm_tmpdir());
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    const char *const env_names[] = {"HOME", "CBM_CACHE_DIR", "PATH", "XDG_CONFIG_HOME"};
+    char *saved_env[sizeof(env_names) / sizeof(env_names[0])];
+    for (size_t i = 0U; i < sizeof(env_names) / sizeof(env_names[0]); i++) {
+        saved_env[i] = save_test_env(env_names[i]);
+        cbm_unsetenv(env_names[i]);
+    }
+
+    const char *const dirs[] = {".claude",          ".codex",      ".gemini",
+                                ".config/opencode", ".augment",    ".openclaw/workspace",
+                                ".hermes",          ".qwen",       ".copilot",
+                                ".factory",         ".qoder",      ".kimi-code",
+                                ".config/devin",    ".gitlab/duo", "bin"};
+    char path[768];
+    for (size_t i = 0U; i < sizeof(dirs) / sizeof(dirs[0]); i++) {
+        snprintf(path, sizeof(path), "%s/%s", tmpdir, dirs[i]);
+        test_mkdirp(path);
+    }
+    snprintf(path, sizeof(path), "%s/.openclaw/openclaw.json", tmpdir);
+    write_test_file(path, "{}\n");
+    snprintf(path, sizeof(path), "%s/.copilot/mcp-config.json", tmpdir);
+    write_test_file(path, "{}\n");
+    /* #1180: a bare ~/.claude is not a Claude Code install; its settings.json is. */
+    snprintf(path, sizeof(path), "%s/.claude/settings.json", tmpdir);
+    write_test_file(path, "{}\n");
+
+    const char *const commands[] = {"qodercli", "kimi",   "duo",    "devin", "gemini",
+                                    "copilot",  "auggie", "hermes", "droid"};
+    char bin_dir[640];
+    snprintf(bin_dir, sizeof(bin_dir), "%s/bin", tmpdir);
+    for (size_t i = 0U; i < sizeof(commands) / sizeof(commands[0]); i++) {
+#ifdef _WIN32
+        snprintf(path, sizeof(path), "%s/%s.exe", bin_dir, commands[i]);
+#else
+        snprintf(path, sizeof(path), "%s/%s", bin_dir, commands[i]);
+#endif
+        write_test_file(path, "exit 0\n");
+        chmod(path, 0700);
+    }
+
+    char cache_dir[640];
+    snprintf(cache_dir, sizeof(cache_dir), "%s/cache", tmpdir);
+    cbm_setenv("HOME", tmpdir, 1);
+    cbm_setenv("CBM_CACHE_DIR", cache_dir, 1);
+    cbm_setenv("PATH", bin_dir, 1);
+    char *no_hooks_args[] = {"--plan", "--no-hooks"};
+    int no_hooks_rc = cli_test_cmd_install(2, no_hooks_args);
+    char *plan = cbm_build_install_plan_json(tmpdir, "/opt/codebase-memory-mcp");
+    yyjson_doc *doc = plan ? yyjson_read(plan, strlen(plan), 0) : NULL;
+    yyjson_val *root = doc ? yyjson_doc_get_root(doc) : NULL;
+    yyjson_val *hooks = root ? yyjson_obj_get(root, "hooks_planned") : NULL;
+    yyjson_val *configs = root ? yyjson_obj_get(root, "config_files_planned") : NULL;
+    yyjson_val *instructions = root ? yyjson_obj_get(root, "instruction_files_planned") : NULL;
+    const char *const detected[] = {"claude-code",    "codex",         "gemini", "opencode",
+                                    "augment-auggie", "openclaw",      "hermes", "qwen",
+                                    "copilot-cli",    "factory-droid", "qoder",  "kimi",
+                                    "gitlab-duo",     "devin"};
+    bool families = no_hooks_rc == 0 && hooks && yyjson_is_arr(hooks) &&
+                    yyjson_arr_size(hooks) == 0U && configs && yyjson_is_arr(configs) &&
+                    yyjson_arr_size(configs) > 0U && instructions && yyjson_is_arr(instructions) &&
+                    yyjson_arr_size(instructions) > 0U && plan && !strstr(plan, "cbm-augment.ts");
+    for (size_t i = 0U; families && i < sizeof(detected) / sizeof(detected[0]); i++) {
+        families = test_json_string_array_contains(root, "agents_detected", detected[i]);
+    }
+    yyjson_doc_free(doc);
+    free(plan);
+
+    char *hooks_args[] = {"--plan", "--hooks"};
+    int hooks_rc = cli_test_cmd_install(2, hooks_args);
+    char *enabled_plan = cbm_build_install_plan_json(tmpdir, "/opt/codebase-memory-mcp");
+    yyjson_doc *enabled_doc =
+        enabled_plan ? yyjson_read(enabled_plan, strlen(enabled_plan), 0) : NULL;
+    yyjson_val *enabled_root = enabled_doc ? yyjson_doc_get_root(enabled_doc) : NULL;
+    yyjson_val *enabled_hooks = enabled_root ? yyjson_obj_get(enabled_root, "hooks_planned") : NULL;
+    bool enabled_plan_ok =
+        enabled_hooks && yyjson_is_arr(enabled_hooks) && yyjson_arr_size(enabled_hooks) > 0U;
+    yyjson_doc_free(enabled_doc);
+    free(enabled_plan);
+    for (size_t i = 0U; i < sizeof(env_names) / sizeof(env_names[0]); i++) {
+        restore_test_env(env_names[i], saved_env[i]);
+    }
+    test_rmdir_r(tmpdir);
+
+    ASSERT_TRUE(families);
+    ASSERT_EQ(hooks_rc, 0);
+    ASSERT_TRUE(enabled_plan_ok);
+    PASS();
+}
+
+/* Counts the PreToolUse hooks in a Codex hooks.json: ours run hook-augment, the
+ * foreign one is matched by its exact command. */
+static void test_codex_pretool_hook_counts(const char *path, const char *foreign_command,
+                                           size_t *owned, size_t *foreign) {
+    *owned = 0U;
+    *foreign = 0U;
+    char *text = read_test_file_alloc(path);
+    yyjson_doc *doc = text ? yyjson_read(text, strlen(text), 0) : NULL;
+    yyjson_val *root = doc ? yyjson_doc_get_root(doc) : NULL;
+    yyjson_val *hooks = root ? yyjson_obj_get(root, "hooks") : NULL;
+    yyjson_val *entries = hooks ? yyjson_obj_get(hooks, "PreToolUse") : NULL;
+    size_t entry_index;
+    size_t entry_count;
+    yyjson_val *entry;
+    if (entries && yyjson_is_arr(entries)) {
+        yyjson_arr_foreach(entries, entry_index, entry_count, entry) {
+            yyjson_val *entry_hooks = yyjson_obj_get(entry, "hooks");
+            size_t hook_index;
+            size_t hook_count;
+            yyjson_val *hook;
+            if (!entry_hooks || !yyjson_is_arr(entry_hooks)) {
+                continue;
+            }
+            yyjson_arr_foreach(entry_hooks, hook_index, hook_count, hook) {
+                const char *command = yyjson_get_str(yyjson_obj_get(hook, "command"));
+                if (command && strstr(command, "hook-augment")) {
+                    (*owned)++;
+                } else if (command && strcmp(command, foreign_command) == 0) {
+                    (*foreign)++;
+                }
+            }
+        }
+    }
+    yyjson_doc_free(doc);
+    free(text);
+}
+
+/* The Codex PreToolUse Bash hook (#2719) follows the persisted opt-out in both
+ * hook representations: --no-hooks removes ours from hooks.json and from the
+ * config.toml managed block, a bare install keeps it off, the user's own
+ * PreToolUse hook and the MCP entry stay, and --hooks restores ours. */
+TEST(cli_no_hooks_removes_codex_pretool_hook) {
+    char tmpdir[512];
+    snprintf(tmpdir, sizeof(tmpdir), "%s/cli-codex-no-hooks-XXXXXX", cbm_tmpdir());
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    const char *const env_names[] = {"HOME", "CBM_CACHE_DIR", "CODEX_HOME", "PATH"};
+    char *saved_env[sizeof(env_names) / sizeof(env_names[0])];
+    for (size_t i = 0U; i < sizeof(env_names) / sizeof(env_names[0]); i++) {
+        saved_env[i] = save_test_env(env_names[i]);
+        cbm_unsetenv(env_names[i]);
+    }
+
+    char cache_dir[640];
+    char codex_dir[640];
+    char hooks_path[768];
+    char config_path[768];
+    snprintf(cache_dir, sizeof(cache_dir), "%s/cache", tmpdir);
+    snprintf(codex_dir, sizeof(codex_dir), "%s/.codex", tmpdir);
+    snprintf(hooks_path, sizeof(hooks_path), "%s/hooks.json", codex_dir);
+    snprintf(config_path, sizeof(config_path), "%s/config.toml", codex_dir);
+    test_mkdirp(codex_dir);
+    /* An installed binary at the default target names the Codex hook command;
+     * without it --skip-binary would configure the test runner itself. */
+    char binary_dir[640];
+    char binary_path[768];
+    snprintf(binary_dir, sizeof(binary_dir), "%s/.local/bin", tmpdir);
+    test_mkdirp(binary_dir);
+#ifdef _WIN32
+    snprintf(binary_path, sizeof(binary_path), "%s/codebase-memory-mcp.exe", binary_dir);
+#else
+    snprintf(binary_path, sizeof(binary_path), "%s/codebase-memory-mcp", binary_dir);
+#endif
+    write_test_file(binary_path, "installed binary\n");
+    const char *foreign_command = "/usr/bin/foreign-shell-audit";
+    write_test_file(hooks_path,
+                    "{\"hooks\":{\"PreToolUse\":[{\"matcher\":\"Bash\",\"hooks\":[{\"type\":"
+                    "\"command\",\"command\":\"/usr/bin/foreign-shell-audit\"}]}]}}\n");
+    cbm_setenv("HOME", tmpdir, 1);
+    cbm_setenv("CBM_CACHE_DIR", cache_dir, 1);
+    cbm_setenv("PATH", tmpdir, 1);
+
+    cli_activation_fake_t fake = {.mutation_reserve_result = 1};
+    cbm_cli_activation_ops_t ops = cli_activation_fake_ops(&fake);
+    cbm_cli_set_activation_ops_for_test(&ops);
+
+    size_t owned = 0U;
+    size_t foreign = 0U;
+    char *default_args[] = {"--skip-binary", "--clients=codex", "--yes"};
+    int default_rc = cli_test_cmd_install(3, default_args);
+    test_codex_pretool_hook_counts(hooks_path, foreign_command, &owned, &foreign);
+    bool default_json = default_rc == 0 && owned == 1U && foreign == 1U;
+
+    char *no_hooks_args[] = {"--no-hooks", "--skip-binary", "--clients=codex", "--yes"};
+    int no_hooks_rc = cli_test_cmd_install(4, no_hooks_args);
+    test_codex_pretool_hook_counts(hooks_path, foreign_command, &owned, &foreign);
+    char *json_state = read_test_file_alloc(hooks_path);
+    char *toml_state = read_test_file_alloc(config_path);
+    bool json_disabled = no_hooks_rc == 0 && owned == 0U && foreign == 1U && json_state &&
+                         !strstr(json_state, "hook-augment");
+    bool json_mcp_kept = toml_state && strstr(toml_state, "[mcp_servers.codebase-memory-mcp]") &&
+                         !strstr(toml_state, "hook-augment");
+    free(json_state);
+    free(toml_state);
+
+    int bare_rc = cli_test_cmd_install(3, default_args);
+    test_codex_pretool_hook_counts(hooks_path, foreign_command, &owned, &foreign);
+    bool bare_disabled = bare_rc == 0 && owned == 0U && foreign == 1U;
+
+    /* Without hooks.json the config.toml managed block carries the hooks. */
+    (void)remove(hooks_path);
+    char *hooks_args[] = {"--hooks", "--skip-binary", "--clients=codex", "--yes"};
+    int toml_enable_rc = cli_test_cmd_install(4, hooks_args);
+    toml_state = read_test_file_alloc(config_path);
+    bool toml_enabled = toml_enable_rc == 0 && toml_state &&
+                        test_count_substring(toml_state, "[[hooks.PreToolUse]]") == 1U;
+    free(toml_state);
+    int toml_disable_rc = cli_test_cmd_install(4, no_hooks_args);
+    toml_state = read_test_file_alloc(config_path);
+    bool toml_disabled = toml_disable_rc == 0 && toml_state &&
+                         !strstr(toml_state, "hooks.PreToolUse") &&
+                         !strstr(toml_state, "hook-augment") &&
+                         strstr(toml_state, "[mcp_servers.codebase-memory-mcp]");
+    free(toml_state);
+    int restore_rc = cli_test_cmd_install(4, hooks_args);
+    toml_state = read_test_file_alloc(config_path);
+    bool restored = restore_rc == 0 && toml_state &&
+                    test_count_substring(toml_state, "[[hooks.PreToolUse]]") == 1U;
+    free(toml_state);
+
+    cbm_cli_set_activation_ops_for_test(NULL);
+    cbm_set_auto_answer_for_test(0);
+    for (size_t i = 0U; i < sizeof(env_names) / sizeof(env_names[0]); i++) {
+        restore_test_env(env_names[i], saved_env[i]);
+    }
+    test_rmdir_r(tmpdir);
+
+    ASSERT_TRUE(default_json);
+    ASSERT_TRUE(json_mcp_kept);
+    ASSERT_TRUE(toml_enabled);
+    ASSERT_TRUE(toml_disabled);
+    ASSERT_TRUE(restored);
+    ASSERT_TRUE(json_disabled);
+    ASSERT_TRUE(bare_disabled);
+    PASS();
+}
+
+/* The Augment SessionStart and PostToolUse view scripts follow the persisted
+ * opt-out the way uninstall treats them: --no-hooks deletes both exact-owned
+ * scripts and keeps the MCP entry, a bare install keeps them off, --hooks
+ * restores them, and a script the user edited is kept. */
+TEST(cli_no_hooks_removes_augment_owned_scripts) {
+    char tmpdir[512];
+    snprintf(tmpdir, sizeof(tmpdir), "%s/cli-augment-no-hooks-XXXXXX", cbm_tmpdir());
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    const char *const env_names[] = {"HOME", "CBM_CACHE_DIR", "PATH"};
+    char *saved_env[sizeof(env_names) / sizeof(env_names[0])];
+    for (size_t i = 0U; i < sizeof(env_names) / sizeof(env_names[0]); i++) {
+        saved_env[i] = save_test_env(env_names[i]);
+        cbm_unsetenv(env_names[i]);
+    }
+
+    char cache_dir[640];
+    char augment_dir[640];
+    char settings_path[768];
+    char session_path[768];
+    char coverage_path[768];
+    snprintf(cache_dir, sizeof(cache_dir), "%s/cache", tmpdir);
+    snprintf(augment_dir, sizeof(augment_dir), "%s/.augment", tmpdir);
+    snprintf(settings_path, sizeof(settings_path), "%s/settings.json", augment_dir);
+#ifdef _WIN32
+    snprintf(session_path, sizeof(session_path), "%s/hooks/codebase-memory-session.ps1",
+             augment_dir);
+    snprintf(coverage_path, sizeof(coverage_path), "%s/hooks/codebase-memory-coverage.ps1",
+             augment_dir);
+#else
+    snprintf(session_path, sizeof(session_path), "%s/hooks/codebase-memory-session.sh",
+             augment_dir);
+    snprintf(coverage_path, sizeof(coverage_path), "%s/hooks/codebase-memory-coverage.sh",
+             augment_dir);
+#endif
+    test_mkdirp(augment_dir);
+    /* An installed binary at the default target is the path the scripts embed;
+     * without it --skip-binary would configure the test runner itself. */
+    char binary_dir[640];
+    char binary_path[768];
+    snprintf(binary_dir, sizeof(binary_dir), "%s/.local/bin", tmpdir);
+    test_mkdirp(binary_dir);
+#ifdef _WIN32
+    snprintf(binary_path, sizeof(binary_path), "%s/codebase-memory-mcp.exe", binary_dir);
+#else
+    snprintf(binary_path, sizeof(binary_path), "%s/codebase-memory-mcp", binary_dir);
+#endif
+    write_test_file(binary_path, "installed binary\n");
+    cbm_setenv("HOME", tmpdir, 1);
+    cbm_setenv("CBM_CACHE_DIR", cache_dir, 1);
+    cbm_setenv("PATH", tmpdir, 1);
+
+    cli_activation_fake_t fake = {.mutation_reserve_result = 1};
+    cbm_cli_activation_ops_t ops = cli_activation_fake_ops(&fake);
+    cbm_cli_set_activation_ops_for_test(&ops);
+
+    char *default_args[] = {"--skip-binary", "--clients=augment", "--yes"};
+    int default_rc = cli_test_cmd_install(3, default_args);
+    bool default_scripts =
+        default_rc == 0 && cbm_file_exists(session_path) && cbm_file_exists(coverage_path);
+
+    char *no_hooks_args[] = {"--no-hooks", "--skip-binary", "--clients=augment", "--yes"};
+    int no_hooks_rc = cli_test_cmd_install(4, no_hooks_args);
+    bool scripts_removed =
+        no_hooks_rc == 0 && !cbm_file_exists(session_path) && !cbm_file_exists(coverage_path);
+    char *settings = read_test_file_alloc(settings_path);
+    bool mcp_kept = settings && strstr(settings, "mcpServers") &&
+                    strstr(settings, "codebase-memory-mcp") &&
+                    !strstr(settings, "codebase-memory-session") &&
+                    !strstr(settings, "codebase-memory-coverage");
+    free(settings);
+
+    int bare_rc = cli_test_cmd_install(3, default_args);
+    bool bare_disabled =
+        bare_rc == 0 && !cbm_file_exists(session_path) && !cbm_file_exists(coverage_path);
+
+    char *hooks_args[] = {"--hooks", "--skip-binary", "--clients=augment", "--yes"};
+    int hooks_rc = cli_test_cmd_install(4, hooks_args);
+    settings = read_test_file_alloc(settings_path);
+    bool restored = hooks_rc == 0 && cbm_file_exists(session_path) &&
+                    cbm_file_exists(coverage_path) && settings &&
+                    strstr(settings, "codebase-memory-session") &&
+                    strstr(settings, "codebase-memory-coverage");
+    free(settings);
+
+    /* A script the user edited is no longer the owned document: the opt-out
+     * keeps it, as uninstall does, and still deletes the untouched one. */
+    char *owned_session = read_test_file_alloc(session_path);
+    char user_session[4096];
+    snprintf(user_session, sizeof(user_session), "%s# local edit\n",
+             owned_session ? owned_session : "");
+    free(owned_session);
+    write_test_file(session_path, user_session);
+    int user_rc = cli_test_cmd_install(4, no_hooks_args);
+    char *kept_session = read_test_file_alloc(session_path);
+    bool user_script_kept = user_rc == 0 && kept_session &&
+                            strcmp(kept_session, user_session) == 0 &&
+                            !cbm_file_exists(coverage_path);
+    free(kept_session);
+
+    /* End on --hooks, as the Codex case does: the opt-out is process state,
+     * and later tests install without the command line. */
+    (void)remove(session_path);
+    int final_rc = cli_test_cmd_install(4, hooks_args);
+    bool final_restored =
+        final_rc == 0 && cbm_file_exists(session_path) && cbm_file_exists(coverage_path);
+
+    cbm_cli_set_activation_ops_for_test(NULL);
+    cbm_set_auto_answer_for_test(0);
+    for (size_t i = 0U; i < sizeof(env_names) / sizeof(env_names[0]); i++) {
+        restore_test_env(env_names[i], saved_env[i]);
+    }
+    test_rmdir_r(tmpdir);
+
+    ASSERT_TRUE(default_scripts);
+    ASSERT_TRUE(mcp_kept);
+    ASSERT_TRUE(restored);
+    ASSERT_TRUE(scripts_removed);
+    ASSERT_TRUE(bare_disabled);
+    ASSERT_TRUE(user_script_kept);
+    ASSERT_TRUE(final_restored);
     PASS();
 }
 
@@ -9449,6 +9984,143 @@ TEST(cli_hermes_stable_shell_context_contract) {
     PASS();
 }
 
+/* A fake HOME holding only ~/.hermes/config.yaml, so install and uninstall
+ * reach exactly the Hermes editors. */
+typedef struct {
+    char tmpdir[256];
+    char config_path[640];
+    char binary_path[640];
+    char *saved_home;
+    char *saved_path;
+    char *saved_hermes;
+} cli_hermes_cycle_t;
+
+static bool cli_hermes_cycle_open(cli_hermes_cycle_t *cycle, const char *initial_config) {
+    memset(cycle, 0, sizeof(*cycle));
+    snprintf(cycle->tmpdir, sizeof(cycle->tmpdir), "/tmp/cli-hermes-cycle-XXXXXX");
+    if (!cbm_mkdtemp(cycle->tmpdir)) {
+        cycle->tmpdir[0] = '\0';
+        return false;
+    }
+    cycle->saved_home = save_test_env("HOME");
+    cycle->saved_path = save_test_env("PATH");
+    cycle->saved_hermes = save_test_env("HERMES_HOME");
+    cbm_setenv("HOME", cycle->tmpdir, 1);
+    cbm_setenv("PATH", cycle->tmpdir, 1);
+    cbm_unsetenv("HERMES_HOME");
+
+    char hermes_dir[512];
+    snprintf(hermes_dir, sizeof(hermes_dir), "%s/.hermes", cycle->tmpdir);
+    snprintf(cycle->config_path, sizeof(cycle->config_path), "%s/config.yaml", hermes_dir);
+#ifdef _WIN32
+    snprintf(cycle->binary_path, sizeof(cycle->binary_path),
+             "%s/.local/bin/codebase-memory-mcp.exe", cycle->tmpdir);
+#else
+    snprintf(cycle->binary_path, sizeof(cycle->binary_path), "%s/.local/bin/codebase-memory-mcp",
+             cycle->tmpdir);
+#endif
+    test_mkdirp(hermes_dir);
+    return write_test_file(cycle->config_path, initial_config) == 0;
+}
+
+static void cli_hermes_cycle_close(cli_hermes_cycle_t *cycle) {
+    if (!cycle->tmpdir[0]) {
+        return;
+    }
+    restore_test_env("HOME", cycle->saved_home);
+    restore_test_env("PATH", cycle->saved_path);
+    restore_test_env("HERMES_HOME", cycle->saved_hermes);
+    test_rmdir_r(cycle->tmpdir);
+    cycle->tmpdir[0] = '\0';
+}
+
+/* Found while finishing #1862: when our hook was the only entry under
+ * `hooks:`, uninstall empties that mapping and the mapping editor writes it as
+ * `hooks: {}` (the same convention as `mcp_servers: {}`). The hook sequence
+ * editor then refused the file, so install -> uninstall -> install exited 1,
+ * and so did a repeated uninstall. The explicit empty mapping must be accepted:
+ * a repeated uninstall changes nothing and the reinstall restores the first
+ * install byte for byte, with exactly one owned hook. */
+TEST(cli_hermes_hook_reinstalls_after_uninstall_empties_hooks) {
+    cli_hermes_cycle_t cycle;
+    if (!cli_hermes_cycle_open(&cycle, "theme: solarized\n")) {
+        cli_hermes_cycle_close(&cycle);
+        FAIL("Hermes fake-HOME setup failed");
+    }
+    char *argv[] = {"uninstall", "--yes"};
+    int install_rc = cbm_install_agent_configs(cycle.tmpdir, cycle.binary_path, false, false);
+    char *installed = read_test_file_alloc(cycle.config_path);
+    int uninstall_rc = cli_test_cmd_uninstall(2, argv);
+    char *emptied = read_test_file_alloc(cycle.config_path);
+    int repeat_rc = cli_test_cmd_uninstall(2, argv);
+    char *repeated = read_test_file_alloc(cycle.config_path);
+    int reinstall_rc = cbm_install_agent_configs(cycle.tmpdir, cycle.binary_path, false, false);
+    char *reinstalled = read_test_file_alloc(cycle.config_path);
+    cli_hermes_cycle_close(&cycle);
+
+    bool installed_once = install_rc == 0 && installed &&
+                          test_count_substring(installed, "pre_llm_call:") == 1U &&
+                          test_count_substring(installed, "hook-augment") == 1U;
+    bool emptied_clean = uninstall_rc == 0 && emptied && strstr(emptied, "theme: solarized\n") &&
+                         test_count_substring(emptied, "hooks: {}\n") == 1U &&
+                         !strstr(emptied, "pre_llm_call") && !strstr(emptied, "hook-augment");
+    bool repeat_unchanged = repeat_rc == 0 && emptied && repeated && strcmp(repeated, emptied) == 0;
+    bool reinstalled_once =
+        reinstall_rc == 0 && installed && reinstalled && strcmp(reinstalled, installed) == 0;
+    free(installed);
+    free(emptied);
+    free(repeated);
+    free(reinstalled);
+    if (!installed_once)
+        FAIL("Hermes install must write exactly one owned pre_llm_call hook");
+    if (!emptied_clean)
+        FAIL("uninstall must remove the owned hook and leave only the empty hooks: {} mapping");
+    if (!repeat_unchanged)
+        FAIL("a repeated uninstall must accept hooks: {} and leave the file unchanged");
+    if (!reinstalled_once)
+        FAIL("reinstall must accept hooks: {} and restore exactly one owned hook");
+    PASS();
+}
+
+/* The same cycle with a user's own hook in the shared pre_llm_call sequence:
+ * the foreign hook survives untouched and uninstall restores the original
+ * file byte for byte. */
+TEST(cli_hermes_hook_cycle_keeps_foreign_pre_llm_hook) {
+    static const char original[] = "theme: solarized\n"
+                                   "mcp_servers: {}\n"
+                                   "hooks:\n"
+                                   "  pre_llm_call:\n"
+                                   "    - command: \"/usr/bin/user-hermes-hook\"\n";
+    cli_hermes_cycle_t cycle;
+    if (!cli_hermes_cycle_open(&cycle, original)) {
+        cli_hermes_cycle_close(&cycle);
+        FAIL("Hermes fake-HOME setup failed");
+    }
+    char *argv[] = {"uninstall", "--yes"};
+    int install_rc = cbm_install_agent_configs(cycle.tmpdir, cycle.binary_path, false, false);
+    char *installed = read_test_file_alloc(cycle.config_path);
+    int uninstall_rc = cli_test_cmd_uninstall(2, argv);
+    char *restored = read_test_file_alloc(cycle.config_path);
+    int reinstall_rc = cbm_install_agent_configs(cycle.tmpdir, cycle.binary_path, false, false);
+    char *reinstalled = read_test_file_alloc(cycle.config_path);
+    cli_hermes_cycle_close(&cycle);
+
+    bool merged = install_rc == 0 && installed &&
+                  test_count_substring(installed, "/usr/bin/user-hermes-hook") == 1U &&
+                  test_count_substring(installed, "pre_llm_call:") == 1U &&
+                  test_count_substring(installed, "hook-augment") == 1U;
+    bool restored_exactly = uninstall_rc == 0 && restored && strcmp(restored, original) == 0;
+    bool reinstalled_once =
+        reinstall_rc == 0 && installed && reinstalled && strcmp(reinstalled, installed) == 0;
+    free(installed);
+    free(restored);
+    free(reinstalled);
+    if (!merged || !restored_exactly || !reinstalled_once)
+        FAIL("a user's own pre_llm_call hook must survive install, uninstall and reinstall, and "
+             "uninstall must restore the original file byte for byte");
+    PASS();
+}
+
 #ifndef _WIN32
 TEST(cli_detected_agent_summary_includes_registry_clients) {
     char tmpdir[256];
@@ -12677,8 +13349,90 @@ TEST(cli_hook_unindexed_worktree_reports_no_match_not_silent) {
     snprintf(input, sizeof(input), "{\"hook_event_name\":\"SessionStart\",\"cwd\":\"%s\"}", wtdir);
     char *wt_out = cbm_hook_augment_lifecycle_json(input);
     bool deliberate = wt_out && wt_out[0] && strstr(wt_out, "no indexed graph project matched") &&
-                      !strstr(wt_out, "is indexed");
+                      strstr(wt_out, "Run index_repository") &&
+                      !strstr(wt_out, "ignore_worktrees is enabled") && !strstr(wt_out, "is indexed");
     free(wt_out);
+
+    /* The hook must read the runtime store. With the key off the note still
+     * says to index; with it on, the same unindexed worktree must not. */
+    cbm_config_t *cfg = cbm_config_open(cache);
+    bool configured = cfg && cbm_config_set(cfg, CBM_CONFIG_IGNORE_WORKTREES, "true") == 0;
+    cbm_config_close(cfg);
+    char *ignored_out = configured ? cbm_hook_augment_lifecycle_json(input) : NULL;
+    bool honored = ignored_out && strstr(ignored_out, "ignore_worktrees is enabled") &&
+                   strstr(ignored_out, "do not run index_repository") &&
+                   !strstr(ignored_out, "is indexed");
+    free(ignored_out);
+
+    /* A symlink to a directory inside that worktree has no lexical .git.
+     * The hook must still follow the real path and honor ignore_worktrees. */
+    char alias_target[600];
+    snprintf(alias_target, sizeof(alias_target), "%s/nested", wtdir);
+    bool alias_target_ok = test_mkdirp(alias_target) == 0;
+    char alias[512];
+    snprintf(alias, sizeof(alias), "%s/wt-alias", tmpdir);
+    bool alias_made = alias_target_ok && symlink(alias_target, alias) == 0;
+    snprintf(input, sizeof(input), "{\"hook_event_name\":\"SessionStart\",\"cwd\":\"%s\"}",
+             alias);
+    char *alias_out = alias_made ? cbm_hook_augment_lifecycle_json(input) : NULL;
+    bool alias_ignored = alias_out && strstr(alias_out, "ignore_worktrees is enabled") &&
+                         strstr(alias_out, "do not run index_repository") &&
+                         !strstr(alias_out, "Run index_repository");
+    free(alias_out);
+
+    /* A linked worktree nested inside the indexed checkout must not inherit
+     * that parent graph once ignore_worktrees is on. */
+    char insider[512];
+    snprintf(insider, sizeof(insider), "%s/inside-wt", maindir);
+    snprintf(cmd, sizeof(cmd), "cd \"%s\" && git worktree add -q \"%s\" -b agl7inside", maindir,
+             insider);
+    bool inside_made = configured && system(cmd) == 0;
+    char inside_sub[600];
+    snprintf(inside_sub, sizeof(inside_sub), "%s/nested", insider);
+    bool inside_sub_made = inside_made && test_mkdirp(inside_sub) == 0;
+    snprintf(input, sizeof(input), "{\"hook_event_name\":\"SessionStart\",\"cwd\":\"%s\"}",
+             inside_sub);
+    char *inside_out = inside_sub_made ? cbm_hook_augment_lifecycle_json(input) : NULL;
+    bool inside_ignored = inside_out && strstr(inside_out, "ignore_worktrees is enabled") &&
+                          strstr(inside_out, "do not run index_repository") &&
+                          !strstr(inside_out, "is indexed") && !strstr(inside_out, main_name);
+    free(inside_out);
+
+    /* Indexing that nested worktree itself must still win over the parent. */
+    char *inside_name = inside_made ? cbm_project_name_from_path(insider) : NULL;
+    bool inside_stored = false;
+    if (inside_name) {
+        char db_inside[900];
+        snprintf(db_inside, sizeof(db_inside), "%s/%s.db", cache, inside_name);
+        cbm_store_t *si = cbm_store_open_path(db_inside);
+        inside_stored = si && cbm_store_upsert_project(si, inside_name, insider) == CBM_STORE_OK;
+        if (si)
+            cbm_store_close(si);
+    }
+    char *exact_out = inside_stored ? cbm_hook_augment_lifecycle_json(input) : NULL;
+    bool exact_kept = exact_out && inside_name && strstr(exact_out, inside_name) &&
+                      strstr(exact_out, "is indexed") &&
+                      !strstr(exact_out, "ignore_worktrees is enabled");
+    free(exact_out);
+
+    /* An unindexed worktree nested inside that indexed worktree must not
+     * inherit the outer worktree's graph. */
+    char child[600];
+    snprintf(child, sizeof(child), "%s/child-wt", insider);
+    snprintf(cmd, sizeof(cmd), "cd \"%s\" && git worktree add -q \"%s\" -b agl7child", maindir,
+             child);
+    bool child_made = inside_stored && system(cmd) == 0;
+    char child_sub[700];
+    snprintf(child_sub, sizeof(child_sub), "%s/sub", child);
+    bool child_sub_made = child_made && test_mkdirp(child_sub) == 0;
+    snprintf(input, sizeof(input), "{\"hook_event_name\":\"SessionStart\",\"cwd\":\"%s\"}",
+             child_sub);
+    char *child_out = child_sub_made ? cbm_hook_augment_lifecycle_json(input) : NULL;
+    bool child_ignored = child_out && inside_name &&
+                         strstr(child_out, "ignore_worktrees is enabled") &&
+                         strstr(child_out, "do not run index_repository") &&
+                         !strstr(child_out, "is indexed") && !strstr(child_out, inside_name);
+    free(child_out);
 
     snprintf(input, sizeof(input), "{\"hook_event_name\":\"SessionStart\",\"cwd\":\"%s\"}",
              maindir);
@@ -12688,6 +13442,7 @@ TEST(cli_hook_unindexed_worktree_reports_no_match_not_silent) {
 
     restore_test_env("CBM_CACHE_DIR", saved_cache);
     free(main_name);
+    free(inside_name);
     snprintf(cmd, sizeof(cmd), "cd \"%s\" && git worktree remove --force \"%s\" >/dev/null 2>&1",
              maindir, wtdir);
     (void)system(cmd);
@@ -12695,8 +13450,108 @@ TEST(cli_hook_unindexed_worktree_reports_no_match_not_silent) {
 
     if (!deliberate)
         FAIL("unindexed worktree must get a deliberate no-match notice, never a silent 0 bytes");
+    if (!honored)
+        FAIL("ignore_worktrees in the runtime config must change the unindexed-worktree note");
+    if (!alias_ignored)
+        FAIL("a symlink into an ignored worktree must not recommend index_repository");
+    if (!inside_ignored)
+        FAIL("a nested linked worktree must not inherit the indexed parent graph");
+    if (!exact_kept)
+        FAIL("an exact index of the nested worktree must still be reported");
+    if (!child_ignored)
+        FAIL("a worktree nested inside an indexed worktree must not inherit that graph");
     if (!main_ok)
         FAIL("the indexed main checkout must still resolve in the same matrix");
+    PASS();
+}
+
+/* With ignore_worktrees unset, the lifecycle hook must do what it did before
+ * the key existed. It may read the key, but it must not create a runtime
+ * config store just to find the key unset, and it must not canonicalize the
+ * cwd or probe for a linked worktree. Turning the key on is the positive
+ * control: the same call then reaches the worktree gate exactly once. */
+TEST(cli_hook_ignore_worktrees_default_off_does_no_worktree_work) {
+    char tmpdir[256];
+    char *raw = th_mktempdir("cbm_hook_wt_off");
+    if (!raw)
+        FAIL("th_mktempdir returned NULL");
+    snprintf(tmpdir, sizeof(tmpdir), "%s", raw);
+    char cache[512];
+    char maindir[512];
+    char wtdir[512];
+    char store_path[600];
+    snprintf(cache, sizeof(cache), "%s/cache", tmpdir);
+    snprintf(maindir, sizeof(maindir), "%s/checkout-main", tmpdir);
+    snprintf(wtdir, sizeof(wtdir), "%s/checkout-side", tmpdir);
+    snprintf(store_path, sizeof(store_path), "%s/" CBM_CONFIG_DB_FILENAME, cache);
+    test_mkdirp(cache);
+    test_mkdirp(maindir);
+
+    char cmd[2048];
+    snprintf(cmd, sizeof(cmd),
+             "cd \"%s\" && git init -q && git config user.email t@t && git config user.name t && "
+             ": > f.txt && git add f.txt && git commit -qm init && "
+             "git worktree add -q \"%s\" -b wtoff",
+             maindir, wtdir);
+    if (system(cmd) != 0) {
+        th_rmtree(tmpdir);
+        SKIP_PLATFORM("git worktree add unavailable");
+    }
+
+    char *saved_cache = save_test_env("CBM_CACHE_DIR");
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+
+    char input[1024];
+    snprintf(input, sizeof(input), "{\"hook_event_name\":\"SessionStart\",\"cwd\":\"%s\"}", wtdir);
+    struct stat st;
+    int gate_calls = 0;
+    cbm_hook_set_worktree_gate_counter_for_testing(&gate_calls);
+    bool store_absent_before = stat(store_path, &st) != 0;
+    char *off_out = cbm_hook_augment_lifecycle_json(input);
+    bool off_note = off_out && strstr(off_out, "Run index_repository") &&
+                    !strstr(off_out, "ignore_worktrees is enabled");
+    free(off_out);
+    bool store_absent_after = stat(store_path, &st) != 0;
+    int off_gate_calls = gate_calls;
+
+    /* A store that leaves the key unset may be read for the key, nothing more. */
+    cbm_config_t *cfg = cbm_config_open(cache);
+    bool other_key_set = cfg && cbm_config_set(cfg, CBM_CONFIG_AUTO_WATCH, "true") == 0;
+    cbm_config_close(cfg);
+    gate_calls = 0;
+    char *unset_out = other_key_set ? cbm_hook_augment_lifecycle_json(input) : NULL;
+    bool unset_note = unset_out && strstr(unset_out, "Run index_repository") &&
+                      !strstr(unset_out, "ignore_worktrees is enabled");
+    free(unset_out);
+    int unset_gate_calls = gate_calls;
+
+    cfg = cbm_config_open(cache);
+    bool enabled = cfg && cbm_config_set(cfg, CBM_CONFIG_IGNORE_WORKTREES, "true") == 0;
+    cbm_config_close(cfg);
+    gate_calls = 0;
+    char *on_out = enabled ? cbm_hook_augment_lifecycle_json(input) : NULL;
+    bool on_note = on_out && strstr(on_out, "ignore_worktrees is enabled");
+    free(on_out);
+    int on_gate_calls = gate_calls;
+    cbm_hook_set_worktree_gate_counter_for_testing(NULL);
+
+    restore_test_env("CBM_CACHE_DIR", saved_cache);
+    snprintf(cmd, sizeof(cmd), "cd \"%s\" && git worktree remove --force \"%s\" >/dev/null 2>&1",
+             maindir, wtdir);
+    (void)system(cmd);
+    th_rmtree(tmpdir);
+
+    ASSERT_TRUE(store_absent_before);
+    ASSERT_TRUE(off_note);
+    if (!store_absent_after)
+        FAIL("a default-off lifecycle event must not create the runtime config store");
+    ASSERT_EQ(off_gate_calls, 0);
+    ASSERT_TRUE(other_key_set);
+    ASSERT_TRUE(unset_note);
+    ASSERT_EQ(unset_gate_calls, 0);
+    ASSERT_TRUE(enabled);
+    ASSERT_TRUE(on_note);
+    ASSERT_EQ(on_gate_calls, 1);
     PASS();
 }
 #endif
@@ -15172,14 +16027,18 @@ TEST(cli_hook_augment_subagent_tier_router_contract) {
 }
 
 TEST(cli_hook_augment_subagent_no_project_guidance_is_read_only) {
-    const char *session = cbm_hook_no_project_index_guidance_for_testing("SessionStart");
-    const char *subagent = cbm_hook_no_project_index_guidance_for_testing("SubagentStart");
+    const char *session = cbm_hook_no_project_index_guidance_for_testing("SessionStart", false);
+    const char *subagent = cbm_hook_no_project_index_guidance_for_testing("SubagentStart", false);
+    const char *worktree = cbm_hook_no_project_index_guidance_for_testing("SessionStart", true);
     ASSERT_NOT_NULL(session);
     ASSERT_NOT_NULL(subagent);
+    ASSERT_NOT_NULL(worktree);
     ASSERT(strstr(session, "Run index_repository") != NULL);
     ASSERT(strstr(subagent, "Ask the parent agent to run index_repository") != NULL);
     ASSERT(strstr(subagent, "do not attempt graph mutation") != NULL);
     ASSERT(strstr(subagent, "Run index_repository") == NULL);
+    ASSERT(strstr(worktree, "ignore_worktrees is enabled") != NULL);
+    ASSERT(strstr(worktree, "do not run index_repository") != NULL);
     PASS();
 }
 
@@ -18265,17 +19124,31 @@ TEST(cli_config_cmd_get_prints_defaults_and_rejects_unknown_keys) {
     char *get_limit[] = {"get", "auto_index_limit"};
     ASSERT_EQ(cli_config_cmd_capture(2, get_limit, out, sizeof(out)), 0);
     ASSERT_STR_EQ(out, "50000\n");
+    char *get_install_hooks[] = {"get", "install_hooks"};
+    ASSERT_EQ(cli_config_cmd_capture(2, get_install_hooks, out, sizeof(out)), 0);
+    ASSERT_STR_EQ(out, "true\n");
+    char *list[] = {"list"};
+    ASSERT_EQ(cli_config_cmd_capture(1, list, out, sizeof(out)), 0);
+    ASSERT_NOT_NULL(strstr(out, "install_hooks"));
 
     /* Stored value round-trips. */
     char *set_watch[] = {"set", "auto_watch", "false"};
     ASSERT_EQ(cli_config_cmd_capture(3, set_watch, out, sizeof(out)), 0);
     ASSERT_EQ(cli_config_cmd_capture(2, get_watch, out, sizeof(out)), 0);
     ASSERT_STR_EQ(out, "false\n");
+    char *set_install_hooks[] = {"set", "install_hooks", "false"};
+    ASSERT_EQ(cli_config_cmd_capture(3, set_install_hooks, out, sizeof(out)), 0);
+    ASSERT_EQ(cli_config_cmd_capture(2, get_install_hooks, out, sizeof(out)), 0);
+    ASSERT_STR_EQ(out, "false\n");
 
     /* Reset returns the key to its default. */
     char *reset_watch[] = {"reset", "auto_watch"};
     ASSERT_EQ(cli_config_cmd_capture(2, reset_watch, out, sizeof(out)), 0);
     ASSERT_EQ(cli_config_cmd_capture(2, get_watch, out, sizeof(out)), 0);
+    ASSERT_STR_EQ(out, "true\n");
+    char *reset_install_hooks[] = {"reset", "install_hooks"};
+    ASSERT_EQ(cli_config_cmd_capture(2, reset_install_hooks, out, sizeof(out)), 0);
+    ASSERT_EQ(cli_config_cmd_capture(2, get_install_hooks, out, sizeof(out)), 0);
     ASSERT_STR_EQ(out, "true\n");
 
     /* Unknown keys are errors on every subcommand, with clean stdout. */
@@ -19282,6 +20155,19 @@ TEST(cli_ui_config_keys_are_discoverable_and_settable_issue1558) {
     PASS();
 }
 
+TEST(cli_ignore_worktrees_config_key_is_discoverable) {
+    bool listed = false;
+    for (size_t i = 0; i < cbm_cli_config_key_count_for_testing(); i++) {
+        const char *key = cbm_cli_config_key_at_for_testing(i);
+        if (key && strcmp(key, CBM_CONFIG_IGNORE_WORKTREES) == 0) {
+            listed = true;
+            break;
+        }
+    }
+    ASSERT_TRUE(listed);
+    PASS();
+}
+
 TEST(cli_skill_frontmatter_scalars_with_colons_are_quoted_issue1554) {
     const cbm_skill_t *sk = cbm_get_skills();
     ASSERT_NOT_NULL(sk);
@@ -20156,6 +21042,10 @@ SUITE(cli) {
     RUN_TEST(cli_install_force_quiesces_active_cohort_before_replacing_binary);
     RUN_TEST(cli_install_dir_and_skip_config_stage_first_install_safely);
     RUN_TEST(cli_activation_commands_reject_malformed_and_unknown_flags);
+    RUN_TEST(cli_install_hooks_preference_persists_and_migrates_owned_state);
+    RUN_TEST(cli_no_hooks_plan_covers_every_hook_installer_family);
+    RUN_TEST(cli_no_hooks_removes_codex_pretool_hook);
+    RUN_TEST(cli_no_hooks_removes_augment_owned_scripts);
     RUN_TEST(cli_install_reset_deletion_waits_for_final_activation_guard);
     RUN_TEST(cli_remove_indexes_deletes_orphan_sqlite_sidecars_issue2054);
     RUN_TEST(cli_index_enumeration_skips_internal_cache_dbs);
@@ -20165,6 +21055,7 @@ SUITE(cli) {
     RUN_TEST(cli_update_download_failure_does_not_quiesce_sessions);
     RUN_TEST(cli_update_already_current_does_not_quiesce_sessions);
     RUN_TEST(cli_ui_config_keys_are_discoverable_and_settable_issue1558);
+    RUN_TEST(cli_ignore_worktrees_config_key_is_discoverable);
     RUN_TEST(cli_skill_frontmatter_scalars_with_colons_are_quoted_issue1554);
     RUN_TEST(cli_external_manager_detection_needs_positive_evidence_issue1566);
     RUN_TEST(cli_install_managed_binary_config_path_issue2722);
@@ -20351,6 +21242,8 @@ SUITE(cli) {
     RUN_TEST(cli_junie_current_durable_context_contract);
     RUN_TEST(cli_rovo_installs_documented_global_memory);
     RUN_TEST(cli_hermes_stable_shell_context_contract);
+    RUN_TEST(cli_hermes_hook_reinstalls_after_uninstall_empties_hooks);
+    RUN_TEST(cli_hermes_hook_cycle_keeps_foreign_pre_llm_hook);
 #ifndef _WIN32
     RUN_TEST(cli_detected_agent_summary_includes_registry_clients);
 #endif
@@ -20405,6 +21298,7 @@ SUITE(cli) {
 #ifndef _WIN32
     RUN_TEST(cli_hook_worktree_cwd_resolves_own_indexed_project);
     RUN_TEST(cli_hook_unindexed_worktree_reports_no_match_not_silent);
+    RUN_TEST(cli_hook_ignore_worktrees_default_off_does_no_worktree_work);
 #endif
     RUN_TEST(cli_hook_session_sanitizes_untrusted_project_metadata);
     RUN_TEST(cli_hook_session_untrusted_label_covers_project_name_only);
